@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2015-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2015-2025 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -32,8 +32,16 @@ extern "C" {
 
 typedef struct {
     gpio_dev_t *dev;
-    uint32_t version;
 } gpio_hal_context_t;
+
+/**
+ * @brief Get the configuration for an IO
+ *
+ * @param hal Context of the HAL layer
+ * @param gpio_num GPIO number
+ * @param[out] out_io_config Pointer to the structure that saves the specific IO configuration
+ */
+#define gpio_hal_get_io_config(hal, gpio_num, out_io_config) gpio_ll_get_io_config((hal)->dev, gpio_num, out_io_config)
 
 /**
   * @brief Enable pull-up on GPIO.
@@ -169,13 +177,33 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
 #define gpio_hal_od_enable(hal, gpio_num) gpio_ll_od_enable((hal)->dev, gpio_num)
 
 /**
+  * @brief Disconnect any peripheral output signal routed via GPIO matrix to the pin
+  *
+  * @param hal Context of the HAL layer
+  * @param gpio_num GPIO number
+  */
+#define gpio_hal_matrix_out_default(hal, gpio_num) gpio_ll_matrix_out_default((hal)->dev, gpio_num)
+
+/**
  * @brief  Select a function for the pin in the IOMUX
  *
- * @param  hw Peripheral GPIO hardware instance address.
+ * @param  hal Context of the HAL layer
  * @param  gpio_num GPIO number
  * @param  func Function to assign to the pin
  */
 #define gpio_hal_func_sel(hal, gpio_num, func)  gpio_ll_func_sel((hal)->dev, gpio_num, func)
+
+/**
+ * @brief  Get the GPIO number that is routed to the input peripheral signal through GPIO matrix
+ *
+ * @param  hal Context of the HAL layer
+ * @param  in_sig_idx Peripheral signal index (tagged as input attribute)
+ *
+ * @return
+ *    - -1     Signal bypassed GPIO matrix
+ *    - Others GPIO number
+ */
+#define gpio_hal_get_in_signal_connected_io(hal, in_sig_idx) gpio_ll_get_in_signal_connected_io((hal)->dev, in_sig_idx)
 
 /**
  * @brief  GPIO set output level
@@ -242,8 +270,8 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
   *   in output mode: the output level of the pad will be force locked and can not be changed.
   *   in input mode: the input value read will not change, regardless the changes of input signal.
   *
-  * The state of digital gpio cannot be held during Deep-sleep, and it will resume the hold function
-  * when the chip wakes up from Deep-sleep. If the digital gpio also needs to be held during Deep-sleep,
+  * On ESP32/S2/C3/S3/C2, the state of digital gpio cannot be held during Deep-sleep, and it will resume the hold
+  * function when the chip wakes up from Deep-sleep. If the digital gpio also needs to be held during Deep-sleep,
   * `gpio_deep_sleep_hold_en` should also be called.
   *
   * Power down or call gpio_hold_dis will disable this function.
@@ -262,7 +290,7 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
   *  e.g.
   *     If you hold gpio18 high during Deep-sleep, after the chip is woken up and `gpio_hold_dis` is called,
   *     gpio18 will output low level(because gpio18 is input mode by default). If you don't want this behavior,
-  *     you should configure gpio18 as output mode and set it to hight level before calling `gpio_hold_dis`.
+  *     you should configure gpio18 as output mode and set it to high level before calling `gpio_hold_dis`.
   *
   * @param hal Context of the HAL layer
   * @param gpio_num GPIO number, only support output GPIOs
@@ -270,7 +298,7 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
 #define gpio_hal_hold_dis(hal, gpio_num) gpio_ll_hold_dis((hal)->dev, gpio_num)
 
 /**
-  * @brief Get wether digital gpio pad is held
+  * @brief Get whether digital gpio pad is held
   *
   * @param hal Context of the HAL layer
   * @param gpio_num GPIO number, only support output GPIOs
@@ -285,6 +313,7 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
   */
 #define gpio_hal_is_digital_io_hold(hal, gpio_num) gpio_ll_is_digital_io_hold((hal)->dev, gpio_num)
 
+#if SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP && !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
 /**
   * @brief Enable all digital gpio pad hold function during Deep-sleep.
   *
@@ -315,26 +344,29 @@ void gpio_hal_intr_disable(gpio_hal_context_t *hal, uint32_t gpio_num);
   *     - false deep sleep hold is disabled
   */
 #define gpio_hal_deep_sleep_hold_is_en(hal) gpio_ll_deep_sleep_hold_is_en((hal)->dev)
+#endif //SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP && !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
 
 /**
   * @brief Set pad input to a peripheral signal through the IOMUX.
   *
   * @param hal Context of the HAL layer
   * @param gpio_num GPIO number of the pad.
+  * @param func The index number of the IOMUX function to be selected for the pin.
+  *        One of the ``FUNC_X_*`` of specified pin (X) in ``soc/io_mux_reg.h``.
   * @param signal_idx Peripheral signal id to input. One of the ``*_IN_IDX`` signals in ``soc/gpio_sig_map.h``.
   */
-#define gpio_hal_iomux_in(hal, gpio_num, signal_idx) gpio_ll_iomux_in((hal)->dev, gpio_num, signal_idx)
+void gpio_hal_iomux_in(gpio_hal_context_t *hal, uint32_t gpio_num, int func, uint32_t signal_idx);
 
 /**
   * @brief Set peripheral output to an GPIO pad through the IOMUX.
   *
   * @param hal Context of the HAL layer
-  * @param gpio_num gpio_num GPIO number of the pad.
-  * @param func The function number of the peripheral pin to output pin.
+  * @param gpio_num GPIO number of the pad.
+  * @param func The index number of the IOMUX function to be selected for the pin.
   *        One of the ``FUNC_X_*`` of specified pin (X) in ``soc/io_mux_reg.h``.
   * @param oen_inv True if the output enable needs to be inverted, otherwise False.
   */
-#define gpio_hal_iomux_out(hal, gpio_num, func, oen_inv) gpio_ll_iomux_out((hal)->dev, gpio_num, func, oen_inv)
+ void gpio_hal_iomux_out(gpio_hal_context_t *hal, uint32_t gpio_num, int func, bool oen_inv);
 
 #if SOC_GPIO_SUPPORT_FORCE_HOLD
 /**
@@ -448,7 +480,7 @@ void gpio_hal_sleep_pupd_config_apply(gpio_hal_context_t *hal, uint32_t gpio_num
 void gpio_hal_sleep_pupd_config_unapply(gpio_hal_context_t *hal, uint32_t gpio_num);
 #endif // CONFIG_GPIO_ESP32_SUPPORT_SWITCH_SLP_PULL
 
-#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP && (SOC_RTCIO_PIN_COUNT == 0) && SOC_DEEP_SLEEP_SUPPORTED
 /**
  * @brief Enable GPIO deep-sleep wake-up function.
  *
@@ -475,7 +507,7 @@ void gpio_hal_sleep_pupd_config_unapply(gpio_hal_context_t *hal, uint32_t gpio_n
  * @return True if the pin is enabled to wake up from deep-sleep
  */
 #define gpio_hal_deepsleep_wakeup_is_enabled(hal, gpio_num) gpio_ll_deepsleep_wakeup_is_enabled((hal)->dev, gpio_num)
-#endif //SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+#endif //SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP && (SOC_RTCIO_PIN_COUNT == 0) && SOC_DEEP_SLEEP_SUPPORTED
 
 /**
  * @brief  Select a function for the pin in the IOMUX
@@ -495,6 +527,7 @@ void gpio_hal_sleep_pupd_config_unapply(gpio_hal_context_t *hal, uint32_t gpio_n
  */
 void gpio_hal_hysteresis_soft_enable(gpio_hal_context_t *hal, uint32_t gpio_num, bool enable);
 
+#if SOC_GPIO_SUPPORT_PIN_HYS_CTRL_BY_EFUSE
 /**
  * @brief Set gpio hysteresis enable/disable by efuse.
  *
@@ -502,7 +535,17 @@ void gpio_hal_hysteresis_soft_enable(gpio_hal_context_t *hal, uint32_t gpio_num,
  * @param gpio_num GPIO number
  */
 #define gpio_hal_hysteresis_from_efuse(hal, gpio_num) gpio_ll_pin_input_hysteresis_ctrl_sel_efuse((hal)->dev, gpio_num)
+#endif
 #endif  // SOC_GPIO_SUPPORT_PIN_HYS_FILTER
+
+/**
+ * @brief Helper function to disconnect internal circuits from an GPIO in sleep mode.
+ *        This function disables input, output, pullup, pulldown for an GPIO in sleep mode.
+ *
+ * @param hal Context of the HAL layer
+ * @param gpio_num GPIO number
+ */
+void gpio_hal_isolate_in_sleep(gpio_hal_context_t *hal, uint32_t gpio_num);
 
 #ifdef __cplusplus
 }

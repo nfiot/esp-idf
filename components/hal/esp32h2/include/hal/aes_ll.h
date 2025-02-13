@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2023-2024 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -9,7 +9,11 @@
 #include <stdbool.h>
 #include <string.h>
 #include "soc/hwcrypto_reg.h"
+#include "soc/pcr_struct.h"
 #include "hal/aes_types.h"
+
+#include "hal/efuse_hal.h"
+#include "soc/chip_revision.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +29,27 @@ typedef enum {
     ESP_AES_STATE_DONE,     /* Transform completed */
 } esp_aes_state_t;
 
+/**
+ * @brief Enable the bus clock for AES peripheral module
+ *
+ * @param enable true to enable the module, false to disable the module
+ */
+static inline void aes_ll_enable_bus_clock(bool enable)
+{
+    PCR.aes_conf.aes_clk_en = enable;
+}
+
+/**
+ * @brief Reset the AES peripheral module
+ */
+static inline void aes_ll_reset_register(void)
+{
+    PCR.aes_conf.aes_rst_en = 1;
+    PCR.aes_conf.aes_rst_en = 0;
+
+    // Clear reset on digital signature also, otherwise AES is held in reset
+    PCR.ds_conf.ds_rst_en = 0;
+}
 
 /**
  * @brief Write the encryption/decryption key to hardware
@@ -112,7 +137,7 @@ static inline void aes_ll_start_transform(void)
  */
 static inline esp_aes_state_t aes_ll_get_state(void)
 {
-    return REG_READ(AES_STATE_REG);
+    return (esp_aes_state_t)REG_READ(AES_STATE_REG);
 }
 
 
@@ -219,6 +244,38 @@ static inline void aes_ll_interrupt_clear(void)
     REG_WRITE(AES_INT_CLEAR_REG, 1);
 }
 
+/**
+ * @brief Enable the pseudo-round function during AES operations
+ *
+ * @param enable true to enable, false to disable
+ * @param base basic number of pseudo rounds, zero if disable
+ * @param increment increment number of pseudo rounds, zero if disable
+ * @param key_rng_cnt update frequency of the pseudo-key, zero if disable
+ */
+static inline void aes_ll_enable_pseudo_rounds(bool enable, uint8_t base, uint8_t increment, uint8_t key_rng_cnt)
+{
+    REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_EN, enable);
+
+    if (enable) {
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_BASE, base);
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_INC, increment);
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_RNG_CNT, key_rng_cnt);
+    } else {
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_BASE, 0);
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_INC, 0);
+        REG_SET_FIELD(AES_PSEUDO_REG, AES_PSEUDO_RNG_CNT, 0);
+    }
+}
+
+/**
+ * @brief Check if the pseudo round function is supported
+ * The AES pseudo round function is only avliable in chip version
+ * above 1.2 in ESP32-H2
+ */
+static inline bool aes_ll_is_pseudo_rounds_function_supported(void)
+{
+    return ESP_CHIP_REV_ABOVE(efuse_hal_chip_revision(), 102);
+}
 
 #ifdef __cplusplus
 }

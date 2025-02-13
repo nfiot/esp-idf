@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_netif_types.h"
 #include "esp_openthread.h"
+#include "esp_openthread_spinel.h"
 #include "openthread/instance.h"
 
 #ifdef __cplusplus
@@ -61,16 +62,19 @@ esp_err_t esp_openthread_border_router_deinit(void);
 esp_netif_t *esp_openthread_get_backbone_netif(void);
 
 /**
- * @brief   Registers the callback for RCP failure.
+ * @brief   Sets the meshcop(e) instance name.
+ *
+ * @note This function can only be called before `esp_openthread_border_router_init`.
+ *       If `instance_name` is NULL, then the service will use the hostname as instance name.
+ *
+ * @param[in]  instance_name   The instance name, can be `NULL`.
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_FAIL if fail to initialize RCP
  *
  */
-void esp_openthread_register_rcp_failure_handler(esp_openthread_rcp_failure_handler handler);
-
-/**
- * @brief   Deinitializes the conneciton to RCP.
- *
- */
-void esp_openthread_rcp_deinit(void);
+esp_err_t esp_openthread_set_meshcop_instance_name(const char *instance_name);
 
 #ifdef __cplusplus
 }

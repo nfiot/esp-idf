@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2021-2024 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -66,7 +66,7 @@ static void timer_test(int flags)
     }
 
     if ((flags & ESP_INTR_FLAG_SHARED)) {
-        /* Check that the allocated interrupts are acutally shared */
+        /* Check that the allocated interrupts are actually shared */
         int intr_num = esp_intr_get_intno(inth[0]);
         for (int i = 0; i < SOC_TIMER_GROUP_TOTAL_TIMERS; i++) {
             TEST_ASSERT_EQUAL(intr_num, esp_intr_get_intno(inth[i]));
@@ -124,10 +124,114 @@ void static test_isr(void*arg)
 }
 
 
+TEST_CASE("Intr_alloc test, shared interrupts don't affect level", "[intr_alloc]")
+{
+    intr_handle_t handle_lvl_1;
+    intr_handle_t handle_lvl_2;
+
+    /* Allocate an interrupt of level 1 that will be shared with another source */
+    esp_err_t err = esp_intr_alloc(ETS_FROM_CPU_INTR2_SOURCE,
+                                   ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_SHARED,
+                                   test_isr, NULL, &handle_lvl_1);
+    TEST_ESP_OK(err);
+
+    /* Allocate a shared interrupt of a different level */
+    err = esp_intr_alloc(ETS_FROM_CPU_INTR3_SOURCE,
+                         ESP_INTR_FLAG_LEVEL2  | ESP_INTR_FLAG_SHARED,
+                         test_isr, NULL, &handle_lvl_2);
+    TEST_ESP_OK(err);
+
+    /* Make sure the allocated CPU line is NOT the same for both sources */
+    const int intlvl1 = esp_intr_get_intno(handle_lvl_1);
+    const int intlvl2 = esp_intr_get_intno(handle_lvl_2);
+    printf("Level 1 interrupt allocated: %d\n", intlvl1);
+    printf("Level 2 interrupt allocated: %d\n", intlvl2);
+    TEST_ASSERT(intlvl1 != intlvl2);
+
+    TEST_ESP_OK(esp_intr_free(handle_lvl_1));
+    TEST_ESP_OK(esp_intr_free(handle_lvl_2));
+}
+
+
+#if SOC_CPU_HAS_FLEXIBLE_INTC
+
+/**
+ * On targets that have flexible interrupt levels, make sure that a shared interrupt sees its level
+ * being cleared (and reconfigurable) uupon remove and reallocation.
+ */
+TEST_CASE("Intr_alloc test, shared interrupts custom level cleared", "[intr_alloc]")
+{
+    intr_handle_t handle;
+
+    esp_err_t err = esp_intr_alloc(ETS_FROM_CPU_INTR2_SOURCE,
+                                   ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_SHARED,
+                                   test_isr, NULL, &handle);
+    TEST_ESP_OK(err);
+    const int first_intno = esp_intr_get_intno(handle);
+    /* Make sure the priority is correct */
+    TEST_ASSERT_EQUAL(1, esp_cpu_intr_get_priority(first_intno));
+
+    /* Free the shared interrupt and try to reallocate it with another level */
+    TEST_ESP_OK(esp_intr_free(handle));
+
+    err = esp_intr_alloc(ETS_FROM_CPU_INTR3_SOURCE,
+                         ESP_INTR_FLAG_LEVEL2  | ESP_INTR_FLAG_SHARED,
+                         test_isr, NULL, &handle);
+    TEST_ESP_OK(err);
+
+    /* Make sure they are both the same and the level has been updated */
+    const int second_intno = esp_intr_get_intno(handle);
+    TEST_ASSERT_EQUAL(2, esp_cpu_intr_get_priority(second_intno));
+    TEST_ASSERT(first_intno == second_intno);
+
+    /* Delete the interrupt */
+    TEST_ESP_OK(esp_intr_free(handle));
+}
+
+#endif
+
+
+/**
+ * Make sure we can map two given sources to the same interrupt line when their levels match.
+ */
+TEST_CASE("Intr_alloc test, shared interrupt line for two sources", "[intr_alloc]")
+{
+    intr_handle_t handle_1;
+    intr_handle_t handle_2;
+
+    esp_err_t err = esp_intr_alloc(ETS_FROM_CPU_INTR2_SOURCE,
+                                   ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_SHARED,
+                                   test_isr, NULL, &handle_1);
+    TEST_ESP_OK(err);
+
+    /* Map another source to the exact same interrupt line */
+    err = esp_intr_alloc_bind(ETS_FROM_CPU_INTR3_SOURCE,
+                              ESP_INTR_FLAG_LEVEL1  | ESP_INTR_FLAG_SHARED,
+                              test_isr, NULL, handle_1, &handle_2);
+    TEST_ESP_OK(err);
+    /* Make sure they are both using the same interrupt line */
+    TEST_ASSERT_EQUAL(esp_intr_get_intno(handle_1), esp_intr_get_intno(handle_2));
+
+    /* Reallocate the second interrupt source with a higher level, it must fail */
+    TEST_ESP_OK(esp_intr_free(handle_2));
+    err = esp_intr_alloc_bind(ETS_FROM_CPU_INTR3_SOURCE,
+                              ESP_INTR_FLAG_LEVEL2  | ESP_INTR_FLAG_SHARED,
+                              test_isr, NULL, handle_1, &handle_2);
+    TEST_ASSERT(err != ESP_OK);
+
+    /* Free the remaining handler */
+    TEST_ESP_OK(esp_intr_free(handle_1));
+}
+
+
 TEST_CASE("Allocate previously freed interrupt, with different flags", "[intr_alloc]")
 {
     intr_handle_t intr;
+#if CONFIG_IDF_TARGET_ESP32P4
+    int test_intr_source = ETS_GPIO_INTR0_SOURCE;
+#else
     int test_intr_source = ETS_GPIO_INTR_SOURCE;
+#endif
     int isr_flags = ESP_INTR_FLAG_LEVEL2;
 
     TEST_ESP_OK(esp_intr_alloc(test_intr_source, isr_flags, test_isr, NULL, &intr));
@@ -173,13 +277,21 @@ void IRAM_ATTR int_handler2(void *arg)
     }
 }
 
+#if !SOC_RCC_IS_INDEPENDENT
+#define TEST_BUS_RCC_CLOCK_ATOMIC() PERIPH_RCC_ATOMIC()
+#else
+#define TEST_BUS_RCC_CLOCK_ATOMIC()
+#endif
 TEST_CASE("allocate 2 handlers for a same source and remove the later one", "[intr_alloc]")
 {
     intr_alloc_test_ctx_t ctx = {false, false, false, false };
     intr_handle_t handle1, handle2;
 
     // enable SPI2
-    periph_module_enable(spi_periph_signal[1].module);
+    TEST_BUS_RCC_CLOCK_ATOMIC() {
+        spi_ll_enable_bus_clock(1, true);
+        spi_ll_reset_register(1);
+    }
 
     esp_err_t r;
     r = esp_intr_alloc(spi_periph_signal[1].irq, ESP_INTR_FLAG_SHARED, int_handler1, &ctx, &handle1);
@@ -275,7 +387,7 @@ void isr_free_task(void *param)
     vTaskDelete(NULL);
 }
 
-void isr_alloc_free_test(void)
+void isr_alloc_free_test(bool isr_free_task_no_affinity)
 {
     intr_handle_t test_handle = NULL;
     esp_err_t ret = esp_intr_alloc(spi_periph_signal[1].irq, 0, int_handler1, NULL, &test_handle);
@@ -284,16 +396,27 @@ void isr_alloc_free_test(void)
     } else {
         printf("alloc isr handle on core %d\n", esp_intr_get_cpu(test_handle));
     }
-    TEST_ASSERT(ret == ESP_OK);
-    xTaskCreatePinnedToCore(isr_free_task, "isr_free_task", 1024 * 2, (void *)&test_handle, 10, NULL, !xPortGetCoreID());
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    TEST_ASSERT(test_handle == NULL);
+    TEST_ESP_OK(ret);
+    if (isr_free_task_no_affinity) {
+        xTaskCreate(isr_free_task, "isr_free_task", 1024 * 2, (void *)&test_handle, 3, NULL);
+        esp_rom_delay_us(500);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    } else {
+        xTaskCreatePinnedToCore(isr_free_task, "isr_free_task", 1024 * 2, (void *)&test_handle, 10, NULL, !xPortGetCoreID());
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    TEST_ASSERT_NULL(test_handle);
     printf("test passed\n");
 }
 
 TEST_CASE("alloc and free isr handle on different core", "[intr_alloc]")
 {
-    isr_alloc_free_test();
+    isr_alloc_free_test(false);
+}
+
+TEST_CASE("alloc and free isr handle on different core when isr_free_task is NO_AFFINITY", "[intr_alloc]")
+{
+    isr_alloc_free_test(true);
 }
 #endif
 

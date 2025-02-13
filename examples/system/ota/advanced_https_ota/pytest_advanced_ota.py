@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2022 Espressif Systems (Shanghai) CO LTD
+# SPDX-FileCopyrightText: 2022-2025 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Unlicense OR CC0-1.0
 import http.server
 import multiprocessing
@@ -13,12 +13,31 @@ from typing import Callable
 
 import pexpect
 import pytest
-from common_test_methods import get_env_config_variable, get_host_ip4_by_dest_ip
+from common_test_methods import get_env_config_variable
+from common_test_methods import get_host_ip4_by_dest_ip
 from pytest_embedded import Dut
 from RangeHTTPServer import RangeRequestHandler
 
+NVS_PARTITION = 'nvs'
+
 server_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test_certs/server_cert.pem')
 key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test_certs/server_key.pem')
+
+
+def restart_device_with_random_delay(dut: Dut, min_delay: int = 10, max_delay: int = 30) -> None:
+    """
+    Restarts the device after a random delay.
+
+    Parameters:
+    - dut: The device under test (DUT) instance.
+    - min_delay: Minimum delay in seconds before restarting.
+    - max_delay: Maximum delay in seconds before restarting.
+    """
+    delay = random.randint(min_delay, max_delay)
+    print(f'Waiting for {delay} seconds before restarting the device...')
+    time.sleep(delay)
+    dut.serial.hard_reset()  # Restart the ESP32 device
+    print('Device restarted after random delay.')
 
 
 def https_request_handler() -> Callable[...,http.server.BaseHTTPRequestHandler]:
@@ -49,9 +68,10 @@ def start_https_server(ota_image_dir: str, server_ip: str, server_port: int) -> 
     requestHandler = https_request_handler()
     httpd = http.server.HTTPServer((server_ip, server_port), requestHandler)
 
-    httpd.socket = ssl.wrap_socket(httpd.socket,
-                                   keyfile=key_file,
-                                   certfile=server_file, server_side=True)
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(certfile=server_file, keyfile=key_file)
+
+    httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
     httpd.serve_forever()
 
 
@@ -87,16 +107,14 @@ def start_redirect_server(ota_image_dir: str, server_ip: str, server_port: int, 
 
     httpd = http.server.HTTPServer((server_ip, server_port), redirectHandler)
 
-    httpd.socket = ssl.wrap_socket(httpd.socket,
-                                   keyfile=key_file,
-                                   certfile=server_file, server_side=True)
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(certfile=server_file, keyfile=key_file)
+
+    httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
     httpd.serve_forever()
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example(dut: Dut) -> None:
     """
@@ -135,9 +153,89 @@ def test_examples_protocol_advanced_https_ota_example(dut: Dut) -> None:
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
+@pytest.mark.wifi_router
+@pytest.mark.parametrize('config', ['ota_resumption'], indirect=True)
+def test_examples_protocol_advanced_https_ota_example_ota_resumption(dut: Dut) -> None:
+    """
+    This is a positive test case, which stops the download midway and resumes downloading again.
+    steps: |
+      1. join AP/Ethernet
+      2. Fetch OTA image over HTTPS
+      3. Reboot with the new OTA image
+    """
+    # Number of iterations to validate OTA
+    server_port = 8001
+    bin_name = 'advanced_https_ota.bin'
+
+    # Erase NVS partition
+    dut.serial.erase_partition(NVS_PARTITION)
+
+    # Start server
+    thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
+    thread1.daemon = True
+    thread1.start()
+    try:
+        # start test
+        dut.expect('Loaded app from partition at offset', timeout=30)
+
+        if dut.app.sdkconfig.get('EXAMPLE_WIFI_SSID_PWD_FROM_STDIN') is True:
+            dut.expect('Please input ssid password:')
+            env_name = 'wifi_router'
+            ap_ssid = get_env_config_variable(env_name, 'ap_ssid')
+            ap_password = get_env_config_variable(env_name, 'ap_password')
+            dut.write(f'{ap_ssid} {ap_password}')
+
+        try:
+            ip_address = dut.expect(r'IPv4 address: (\d+\.\d+\.\d+\.\d+)[^\d]', timeout=30)[1].decode()
+            print('Connected to AP/Ethernet with IP: {}'.format(ip_address))
+        except pexpect.exceptions.TIMEOUT:
+            raise ValueError('ENV_TEST_FAILURE: Cannot connect to AP/Ethernet')
+
+        dut.expect('Starting Advanced OTA example', timeout=30)
+        host_ip = get_host_ip4_by_dest_ip(ip_address)
+
+        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
+        dut.write('https://' + host_ip + ':' + str(server_port) + '/' + bin_name)
+        dut.expect('Starting OTA...', timeout=60)
+
+        restart_device_with_random_delay(dut, 10, 30)
+        thread1.terminate()
+
+        # Start server
+        thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
+        thread1.daemon = True
+        thread1.start()
+
+        # Validate that the device restarts correctly
+        dut.expect('Loaded app from partition at offset', timeout=180)
+
+        if dut.app.sdkconfig.get('EXAMPLE_WIFI_SSID_PWD_FROM_STDIN') is True:
+            dut.expect('Please input ssid password:')
+            env_name = 'wifi_router'
+            ap_ssid = get_env_config_variable(env_name, 'ap_ssid')
+            ap_password = get_env_config_variable(env_name, 'ap_password')
+            dut.write(f'{ap_ssid} {ap_password}')
+
+        try:
+            ip_address = dut.expect(r'IPv4 address: (\d+\.\d+\.\d+\.\d+)[^\d]', timeout=30)[1].decode()
+            print('Connected to AP/Ethernet with IP: {}'.format(ip_address))
+        except pexpect.exceptions.TIMEOUT:
+            raise ValueError('ENV_TEST_FAILURE: Cannot connect to AP/Ethernet')
+
+        dut.expect('Starting Advanced OTA example', timeout=30)
+        host_ip = get_host_ip4_by_dest_ip(ip_address)
+
+        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
+        dut.write('https://' + host_ip + ':' + str(server_port) + '/' + bin_name)
+        dut.expect('Starting OTA...', timeout=60)
+
+        dut.expect('upgrade successful. Rebooting ...', timeout=150)
+
+    finally:
+        thread1.terminate()
+
+
+@pytest.mark.esp32
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_truncated_bin(dut: Dut) -> None:
     """
@@ -159,8 +257,8 @@ def test_examples_protocol_advanced_https_ota_example_truncated_bin(dut: Dut) ->
     truncated_bin_size = 64000
     binary_file = os.path.join(dut.app.binary_path, bin_name)
     with open(binary_file, 'rb+') as f:
-        with open(os.path.join(dut.app.binary_path, truncated_bin_name), 'wb+') as fo:
-            fo.write(f.read(truncated_bin_size))
+        with open(os.path.join(dut.app.binary_path, truncated_bin_name), 'wb+') as output_file:
+            output_file.write(f.read(truncated_bin_size))
     binary_file = os.path.join(dut.app.binary_path, truncated_bin_name)
     # Start server
     thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
@@ -189,13 +287,10 @@ def test_examples_protocol_advanced_https_ota_example_truncated_bin(dut: Dut) ->
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_truncated_header(dut: Dut) -> None:
     """
-    Working of OTA if headers of binary file are truncated is vaildated in this test case.
+    Working of OTA if headers of binary file are truncated is validated in this test case.
     Application should return with error message in this case.
     steps: |
       1. join AP/Ethernet
@@ -213,8 +308,8 @@ def test_examples_protocol_advanced_https_ota_example_truncated_header(dut: Dut)
     # check and log bin size
     binary_file = os.path.join(dut.app.binary_path, bin_name)
     with open(binary_file, 'rb+') as f:
-        with open(os.path.join(dut.app.binary_path, truncated_bin_name), 'wb+') as fo:
-            fo.write(f.read(truncated_bin_size))
+        with open(os.path.join(dut.app.binary_path, truncated_bin_name), 'wb+') as output_file:
+            output_file.write(f.read(truncated_bin_size))
     binary_file = os.path.join(dut.app.binary_path, truncated_bin_name)
     # Start server
     thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
@@ -233,7 +328,7 @@ def test_examples_protocol_advanced_https_ota_example_truncated_header(dut: Dut)
         dut.expect('Starting Advanced OTA example', timeout=30)
         print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + truncated_bin_name))
         dut.write('https://' + host_ip + ':' + str(server_port) + '/' + truncated_bin_name)
-        dut.expect('advanced_https_ota_example: esp_https_ota_read_img_desc failed', timeout=30)
+        dut.expect('advanced_https_ota_example: esp_https_ota_get_img_desc failed', timeout=30)
         try:
             os.remove(binary_file)
         except OSError:
@@ -243,9 +338,6 @@ def test_examples_protocol_advanced_https_ota_example_truncated_header(dut: Dut)
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_random(dut: Dut) -> None:
     """
@@ -260,16 +352,16 @@ def test_examples_protocol_advanced_https_ota_example_random(dut: Dut) -> None:
     server_port = 8001
     # Random binary file to be generated
     random_bin_name = 'random.bin'
-    # Size of random binary file. 32000 is choosen, to reduce the time required to run the test-case
+    # Size of random binary file. 32000 is chosen, to reduce the time required to run the test-case
     random_bin_size = 32000
     # check and log bin size
     binary_file = os.path.join(dut.app.binary_path, random_bin_name)
-    with open(binary_file, 'wb+') as fo:
+    with open(binary_file, 'wb+') as output_file:
         # First byte of binary file is always set to zero. If first byte is generated randomly,
         # in some cases it may generate 0xE9 which will result in failure of testcase.
-        fo.write(struct.pack('B', 0))
+        output_file.write(struct.pack('B', 0))
         for i in range(random_bin_size - 1):
-            fo.write(struct.pack('B', random.randrange(0,255,1)))
+            output_file.write(struct.pack('B', random.randrange(0,255,1)))
     # Start server
     thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
     thread1.daemon = True
@@ -297,9 +389,6 @@ def test_examples_protocol_advanced_https_ota_example_random(dut: Dut) -> None:
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_invalid_chip_id(dut: Dut) -> None:
     """
@@ -316,7 +405,7 @@ def test_examples_protocol_advanced_https_ota_example_invalid_chip_id(dut: Dut) 
     # Random binary file to be generated
     random_bin_name = 'random.bin'
     random_binary_file = os.path.join(dut.app.binary_path, random_bin_name)
-    # Size of random binary file. 2000 is choosen, to reduce the time required to run the test-case
+    # Size of random binary file. 2000 is chosen, to reduce the time required to run the test-case
     random_bin_size = 2000
 
     binary_file = os.path.join(dut.app.binary_path, bin_name)
@@ -324,8 +413,8 @@ def test_examples_protocol_advanced_https_ota_example_invalid_chip_id(dut: Dut) 
         data = list(f.read(random_bin_size))
     # Changing Chip id
     data[13] = 0xfe
-    with open(random_binary_file, 'wb+') as fo:
-        fo.write(bytearray(data))
+    with open(random_binary_file, 'wb+') as output_file:
+        output_file.write(bytearray(data))
     # Start server
     thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
     thread1.daemon = True
@@ -353,9 +442,6 @@ def test_examples_protocol_advanced_https_ota_example_invalid_chip_id(dut: Dut) 
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_chunked(dut: Dut) -> None:
     """
@@ -392,9 +478,6 @@ def test_examples_protocol_advanced_https_ota_example_chunked(dut: Dut) -> None:
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_redirect_url(dut: Dut) -> None:
     """
@@ -448,10 +531,7 @@ def test_examples_protocol_advanced_https_ota_example_redirect_url(dut: Dut) -> 
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
-@pytest.mark.ethernet_flash_8m
+@pytest.mark.flash_encryption_ota
 @pytest.mark.parametrize('config', ['anti_rollback',], indirect=True)
 @pytest.mark.parametrize('skip_autoflash', ['y'], indirect=True)
 def test_examples_protocol_advanced_https_ota_example_anti_rollback(dut: Dut) -> None:
@@ -475,11 +555,11 @@ def test_examples_protocol_advanced_https_ota_example_anti_rollback(dut: Dut) ->
     binary_file = os.path.join(dut.app.binary_path, bin_name)
     file_size = os.path.getsize(binary_file)
     with open(binary_file, 'rb+') as f:
-        with open(os.path.join(dut.app.binary_path, anti_rollback_bin_name), 'wb+') as fo:
-            fo.write(f.read(file_size))
+        with open(os.path.join(dut.app.binary_path, anti_rollback_bin_name), 'wb+') as output_file:
+            output_file.write(f.read(file_size))
             # Change security_version to 0 for negative test case
-            fo.seek(36)
-            fo.write(b'\x00')
+            output_file.seek(36)
+            output_file.write(b'\x00')
     binary_file = os.path.join(dut.app.binary_path, anti_rollback_bin_name)
     # Start server
     thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
@@ -519,9 +599,6 @@ def test_examples_protocol_advanced_https_ota_example_anti_rollback(dut: Dut) ->
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 @pytest.mark.parametrize('config', ['partial_download',], indirect=True)
 def test_examples_protocol_advanced_https_ota_example_partial_request(dut: Dut) -> None:
@@ -569,8 +646,94 @@ def test_examples_protocol_advanced_https_ota_example_partial_request(dut: Dut) 
 
 
 @pytest.mark.esp32
+@pytest.mark.wifi_router
+@pytest.mark.parametrize('config', ['ota_resumption_partial_download',], indirect=True)
+def test_examples_protocol_advanced_https_ota_example_ota_resumption_partial_download_request(dut: Dut) -> None:
+    """
+    This is a positive test case, to test OTA workflow with Range HTTP header.
+    steps: |
+      1. join AP/Ethernet
+      2. Fetch OTA image over HTTPS
+      3. Reboot with the new OTA image
+    """
+    server_port = 8001
+    # Size of partial HTTP request
+    request_size = int(dut.app.sdkconfig.get('EXAMPLE_HTTP_REQUEST_SIZE'))
+    # File to be downloaded. This file is generated after compilation
+    bin_name = 'advanced_https_ota.bin'
+    binary_file = os.path.join(dut.app.binary_path, bin_name)
+    bin_size = os.path.getsize(binary_file)
+    http_requests = int((bin_size / request_size) - 1)
+    assert http_requests > 1
+
+    # Erase NVS partition
+    dut.serial.erase_partition(NVS_PARTITION)
+
+    # Start server
+    thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
+    thread1.daemon = True
+    thread1.start()
+    try:
+        # start test
+        dut.expect('Loaded app from partition at offset', timeout=30)
+
+        if dut.app.sdkconfig.get('EXAMPLE_WIFI_SSID_PWD_FROM_STDIN') is True:
+            dut.expect('Please input ssid password:')
+            env_name = 'wifi_router'
+            ap_ssid = get_env_config_variable(env_name, 'ap_ssid')
+            ap_password = get_env_config_variable(env_name, 'ap_password')
+            dut.write(f'{ap_ssid} {ap_password}')
+
+        try:
+            ip_address = dut.expect(r'IPv4 address: (\d+\.\d+\.\d+\.\d+)[^\d]', timeout=30)[1].decode()
+            print('Connected to AP/Ethernet with IP: {}'.format(ip_address))
+        except pexpect.exceptions.TIMEOUT:
+            raise ValueError('ENV_TEST_FAILURE: Cannot connect to AP')
+        host_ip = get_host_ip4_by_dest_ip(ip_address)
+
+        dut.expect('Starting Advanced OTA example', timeout=30)
+        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
+        dut.write('https://' + host_ip + ':' + str(server_port) + '/' + bin_name)
+
+        restart_device_with_random_delay(dut, 10, 30)
+        thread1.terminate()
+
+        # Start server
+        thread1 = multiprocessing.Process(target=start_https_server, args=(dut.app.binary_path, '0.0.0.0', server_port))
+        thread1.daemon = True
+        thread1.start()
+
+        # Validate that the device restarts correctly
+        dut.expect('Loaded app from partition at offset', timeout=180)
+
+        if dut.app.sdkconfig.get('EXAMPLE_WIFI_SSID_PWD_FROM_STDIN') is True:
+            dut.expect('Please input ssid password:')
+            env_name = 'wifi_router'
+            ap_ssid = get_env_config_variable(env_name, 'ap_ssid')
+            ap_password = get_env_config_variable(env_name, 'ap_password')
+            dut.write(f'{ap_ssid} {ap_password}')
+
+        try:
+            ip_address = dut.expect(r'IPv4 address: (\d+\.\d+\.\d+\.\d+)[^\d]', timeout=30)[1].decode()
+            print('Connected to AP/Ethernet with IP: {}'.format(ip_address))
+        except pexpect.exceptions.TIMEOUT:
+            raise ValueError('ENV_TEST_FAILURE: Cannot connect to AP/Ethernet')
+
+        dut.expect('Starting Advanced OTA example', timeout=30)
+        host_ip = get_host_ip4_by_dest_ip(ip_address)
+
+        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
+        dut.write('https://' + host_ip + ':' + str(server_port) + '/' + bin_name)
+        dut.expect('Starting OTA...', timeout=60)
+
+        dut.expect('upgrade successful. Rebooting ...', timeout=150)
+
+    finally:
+        thread1.terminate()
+
+
+@pytest.mark.esp32
 @pytest.mark.esp32c3
-@pytest.mark.esp32s2
 @pytest.mark.esp32s3
 @pytest.mark.wifi_high_traffic
 @pytest.mark.parametrize('config', ['nimble',], indirect=True)
@@ -622,7 +785,6 @@ def test_examples_protocol_advanced_https_ota_example_nimble_gatts(dut: Dut) -> 
 
 @pytest.mark.esp32
 @pytest.mark.esp32c3
-@pytest.mark.esp32s2
 @pytest.mark.esp32s3
 @pytest.mark.wifi_high_traffic
 @pytest.mark.parametrize('config', ['bluedroid',], indirect=True)
@@ -659,11 +821,11 @@ def test_examples_protocol_advanced_https_ota_example_bluedroid_gatts(dut: Dut) 
             raise ValueError('ENV_TEST_FAILURE: Cannot connect to AP')
         host_ip = get_host_ip4_by_dest_ip(ip_address)
 
-        dut.expect('Starting Advanced OTA example', timeout=30)
-        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
         dut.expect('Started advertising.', timeout=30)
         print('Started GAP advertising.')
 
+        time.sleep(1)
+        print('writing to device: {}'.format('https://' + host_ip + ':' + str(server_port) + '/' + bin_name))
         dut.write('https://' + host_ip + ':' + str(server_port) + '/' + bin_name)
         dut.expect('upgrade successful. Rebooting ...', timeout=150)
         # after reboot
@@ -674,9 +836,6 @@ def test_examples_protocol_advanced_https_ota_example_bluedroid_gatts(dut: Dut) 
 
 
 @pytest.mark.esp32
-@pytest.mark.esp32c3
-@pytest.mark.esp32s2
-@pytest.mark.esp32s3
 @pytest.mark.ethernet_ota
 def test_examples_protocol_advanced_https_ota_example_openssl_aligned_bin(dut: Dut) -> None:
     """
@@ -697,10 +856,10 @@ def test_examples_protocol_advanced_https_ota_example_openssl_aligned_bin(dut: D
     # Dummy data required to align binary size to 289 bytes boundary
     dummy_data_size = 289 - (bin_size % 289)
     with open(binary_file, 'rb+') as f:
-        with open(os.path.join(dut.app.binary_path, aligned_bin_name), 'wb+') as fo:
-            fo.write(f.read(bin_size))
+        with open(os.path.join(dut.app.binary_path, aligned_bin_name), 'wb+') as output_file:
+            output_file.write(f.read(bin_size))
             for _ in range(dummy_data_size):
-                fo.write(struct.pack('B', random.randrange(0,255,1)))
+                output_file.write(struct.pack('B', random.randrange(0,255,1)))
     # Start server
     chunked_server = start_chunked_server(dut.app.binary_path, 8070)
     try:

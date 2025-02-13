@@ -1,17 +1,22 @@
 #
-# SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+# SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
 #
-
 import collections
 import fnmatch
 import itertools
 from collections import namedtuple
 
 from .entity import Entity
-from .fragments import Keep, Scheme, Sections, Sort, Surround
+from .fragments import Keep
+from .fragments import Scheme
+from .fragments import Sections
+from .fragments import Sort
+from .fragments import Surround
 from .ldgen_common import LdGenFailure
-from .output_commands import AlignAtAddress, InputSectionDesc, SymbolAtAddress
+from .output_commands import AlignAtAddress
+from .output_commands import InputSectionDesc
+from .output_commands import SymbolAtAddress
 
 
 class Placement:
@@ -78,11 +83,22 @@ class Placement:
         #
         # Placement can also be a basis if it has flags
         # (self.flags) or its basis has flags (self.basis.flags)
-        return (not self.basis or
-                self.target != self.basis.target or
-                (self.flags and not self.basis.flags) or
-                (not self.flags and self.basis.flags) or
-                self.force)
+        significant = (not self.basis or
+                       self.target != self.basis.target or
+                       (self.flags and not self.basis.flags) or
+                       (not self.flags and self.basis.flags) or
+                       self.force)
+
+        if significant and not self.explicit and not self.sections:
+            # The placement is significant, but it is an intermediate placement
+            # for an expanded object with no input sections. In this situation,
+            # report the placement as not significant, so its command is not
+            # emitted in the linker script. Otherwise, only the entity without
+            # input sections would be emitted, and the linker would include
+            # all input sections that have not yet been mapped.
+            significant = False
+
+        return significant
 
     def force_significant(self):
         if not self.is_significant():
@@ -149,7 +165,7 @@ class EntityNode:
 
         return child
 
-    def get_output_commands(self):
+    def get_output_commands(self, non_contiguous_sram):
         commands = collections.defaultdict(list)
 
         def process_commands(cmds):
@@ -157,18 +173,18 @@ class EntityNode:
                 commands[target].extend(commands_list)
 
         # Process the commands generated from this node
-        node_commands = self.get_node_output_commands()
+        node_commands = self.get_node_output_commands(non_contiguous_sram)
         process_commands(node_commands)
 
         # Process the commands generated from this node's children
         # recursively
         for child in sorted(self.children, key=lambda c: c.name):
-            children_commands = child.get_output_commands()
+            children_commands = child.get_output_commands(non_contiguous_sram)
             process_commands(children_commands)
 
         return commands
 
-    def get_node_output_commands(self):
+    def get_node_output_commands(self, non_contiguous_sram):
         commands = collections.defaultdict(list)
 
         for sections in self.get_output_sections():
@@ -176,6 +192,7 @@ class EntityNode:
             if placement.is_significant():
                 assert placement.node == self
 
+                tied = False
                 keep = False
                 sort = None
                 surround_type = []
@@ -188,14 +205,16 @@ class EntityNode:
                     elif isinstance(flag, Sort):
                         sort = (flag.first, flag.second)
                     else:  # SURROUND or ALIGN
+                        if non_contiguous_sram and isinstance(flag, Surround):
+                            tied = True
                         surround_type.append(flag)
 
                 for flag in surround_type:
                     if flag.pre:
                         if isinstance(flag, Surround):
-                            commands[placement.target].append(SymbolAtAddress('_%s_start' % flag.symbol))
+                            commands[placement.target].append(SymbolAtAddress(f'_{flag.symbol}_start', tied))
                         else:  # ALIGN
-                            commands[placement.target].append(AlignAtAddress(flag.alignment))
+                            commands[placement.target].append(AlignAtAddress(flag.alignment, tied))
 
                 # This is for expanded object node and symbol node placements without checking for
                 # the type.
@@ -203,7 +222,7 @@ class EntityNode:
                 command_sections = sections if sections == placement_sections else placement_sections
 
                 command = InputSectionDesc(placement.node.entity, command_sections,
-                                           [e.node.entity for e in placement.exclusions], keep, sort)
+                                           [e.node.entity for e in placement.exclusions], keep, sort, tied)
                 commands[placement.target].append(command)
 
                 # Generate commands for intermediate, non-explicit exclusion placements here,
@@ -211,15 +230,15 @@ class EntityNode:
                 for subplacement in placement.subplacements:
                     if not subplacement.flags and not subplacement.explicit:
                         command = InputSectionDesc(subplacement.node.entity, subplacement.sections,
-                                                   [e.node.entity for e in subplacement.exclusions], keep, sort)
+                                                   [e.node.entity for e in subplacement.exclusions], keep, sort, tied)
                         commands[placement.target].append(command)
 
                 for flag in surround_type:
                     if flag.post:
                         if isinstance(flag, Surround):
-                            commands[placement.target].append(SymbolAtAddress('_%s_end' % flag.symbol))
+                            commands[placement.target].append(SymbolAtAddress(f'_{flag.symbol}_end', tied))
                         else:  # ALIGN
-                            commands[placement.target].append(AlignAtAddress(flag.alignment))
+                            commands[placement.target].append(AlignAtAddress(flag.alignment, tied))
 
         return commands
 
@@ -471,7 +490,7 @@ class Generation:
 
                         sections_str = get_section_strs(section)
 
-                        key = (entity, section.name)
+                        key = (entity, sections_str)
 
                         try:
                             existing = entity_mappings[key]
@@ -504,7 +523,7 @@ class Generation:
         res.sort(key=lambda m: m.entity)
         return res
 
-    def generate(self, entities):
+    def generate(self, entities, non_contiguous_sram):
         scheme_dictionary = self._prepare_scheme_dictionary()
         entity_mappings = self._prepare_entity_mappings(scheme_dictionary, entities)
         root_node = RootNode()
@@ -516,7 +535,7 @@ class Generation:
                 raise GenerationException(str(e))
 
         # Traverse the tree, creating the placements
-        commands = root_node.get_output_commands()
+        commands = root_node.get_output_commands(non_contiguous_sram)
 
         return commands
 
